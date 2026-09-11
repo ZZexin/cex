@@ -1,0 +1,24 @@
+[project]
+name = "cex-tool"
+version = "0.1.0"
+description = "LAND (蓝电) .cex battery test data decoder / converter with Streamlit UI"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "streamlit>=1.40",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "plotly>=5.24",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
