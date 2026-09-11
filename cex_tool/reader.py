@@ -294,3 +294,76 @@ def cycle_summary(df: pd.DataFrame) -> pd.DataFrame:
             "Duration_h": float((d["TestTime_s"].iloc[-1] - d["TestTime_s"].iloc[0]) / 3600),
         })
     return pd.DataFrame(rows)
+
+
+def adjust_cycle_measurements(
+    df: pd.DataFrame,
+    *,
+    capacity_scale_pct: float = 100.0,
+    capacity_offset_mah: float = 0.0,
+    efficiency_scale_pct: float = 100.0,
+    efficiency_offset_pct: float = 0.0,
+) -> pd.DataFrame:
+    """Transform cycle totals, distributing targets over zero-based step curves.
+
+    Each charge/discharge cycle total becomes Q * scale / 100 + offset.
+    CE is transformed afterwards, holding the target charge total fixed.
+    Step currents are normalized to integrate to their new capacity; energy is
+    integrated along the new capacity curve. The input is never mutated.
+    """
+    out = df.copy()
+    if out.empty or "Capacity_mAh" not in out:
+        return out
+
+    params = np.array([capacity_scale_pct, capacity_offset_mah,
+                       efficiency_scale_pct, efficiency_offset_pct], dtype=float)
+    if not np.isfinite(params).all():
+        raise ValueError("调整参数必须为有限数值。")
+    if np.array_equal(params, [100.0, 0.0, 100.0, 0.0]):
+        return out
+    if capacity_scale_pct < 0 or efficiency_scale_pct < 0:
+        raise ValueError("百分比缩放不能为负数。")
+
+    active = out["Mode"].isin(["CC_Chg", "CC_DChg"])
+    # Use positional indices so callers may supply a non-unique DataFrame index.
+    source_index = out.index
+    out = out.reset_index(drop=True)
+    groups = out.loc[active.to_numpy()].groupby(["Cycle", "Mode"], observed=True, sort=False)
+    for cyc, cycle in out.loc[active.to_numpy()].groupby("Cycle", sort=False):
+        targets = {}
+        totals = {}
+        for mode, records in cycle.groupby("Mode", observed=True, sort=False):
+            total = float(records.groupby("StepSeq")["Capacity_mAh"].max().sum())
+            target = total * capacity_scale_pct / 100.0 + capacity_offset_mah
+            if not np.isfinite(total) or total <= 0 or not np.isfinite(target) or target <= 0:
+                raise ValueError(f"循环 {cyc} {mode} 的原容量和目标容量必须大于 0；请减小负 offset。")
+            totals[mode], targets[mode] = total, target
+        if "CC_Chg" in targets and "CC_DChg" in targets:
+            ce = targets["CC_DChg"] / targets["CC_Chg"] * 100
+            ce = ce * efficiency_scale_pct / 100.0 + efficiency_offset_pct
+            if not np.isfinite(ce) or ce <= 0:
+                raise ValueError(f"循环 {cyc} 的目标库仑效率必须大于 0。")
+            targets["CC_DChg"] = targets["CC_Chg"] * ce / 100.0
+        for mode, target in targets.items():
+            for _, step in groups.get_group((cyc, mode)).groupby("StepSeq", sort=False):
+                idx = step.index
+                q = step["Capacity_mAh"].to_numpy(dtype=float)
+                target_step = float(q.max()) * target / totals[mode]
+                span = q[-1] - q[0]
+                if not np.isfinite(q).all() or np.any(np.diff(q) < 0) or span <= 0:
+                    raise ValueError(f"循环 {cyc} 工步 {step['StepSeq'].iloc[0]} 缺少可缩放的累计容量曲线。")
+                q = (q - q[0]) * (target_step / span)
+                out.loc[idx, "Capacity_mAh"] = q
+                if "Current_mA" in out:
+                    current = step["Current_mA"].to_numpy(dtype=float)
+                    elapsed = np.diff(step["TestTime_s"].to_numpy(dtype=float))
+                    integral = np.sum((np.abs(current[1:]) + np.abs(current[:-1])) * 0.5 * elapsed) / 3600
+                    if not np.isfinite(integral) or integral <= 0 or np.any(elapsed < 0):
+                        raise ValueError(f"循环 {cyc} 的电流或时间无法反算目标容量。")
+                    out.loc[idx, "Current_mA"] = current * (target_step / integral)
+                if "Energy_mWh" in out:
+                    voltage = step["Voltage_V"].to_numpy(dtype=float)
+                    out.loc[idx, "Energy_mWh"] = np.r_[0.0, np.cumsum(
+                        0.5 * (voltage[1:] + voltage[:-1]) * np.diff(q))]
+    out.index = source_index
+    return out

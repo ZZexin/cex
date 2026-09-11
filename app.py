@@ -13,7 +13,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from cex_tool import format as F
-from cex_tool.reader import cycle_summary, parse_cex, to_dataframe
+from cex_tool.reader import adjust_cycle_measurements, cycle_summary, parse_cex, to_dataframe
 from cex_tool.writer import (ROLES, UNIT_FACTORS, build_cex, detect_columns, load_template,
                              normalize_table, segment_table, template_from_cex)
 
@@ -61,7 +61,7 @@ def parse_bytes(data: bytes, v_lsb: float, i_lsb: float):
 
 @st.cache_data(show_spinner=False)
 def csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False, float_format="%.6g").encode("utf-8-sig")
+    return df.to_csv(index=False, float_format="%.12g").encode("utf-8-sig")
 
 
 @st.cache_data(show_spinner=False)
@@ -127,6 +127,80 @@ def fig_profiles(df: pd.DataFrame, cycles: list[int]) -> go.Figure:
     return fig
 
 
+def render_dataset(stem: str, df: pd.DataFrame, summ: pd.DataFrame, key: str,
+                   allow_cycle_adjustments: bool = False) -> tuple[bytes, bytes]:
+    """预览 / 曲线 / 循环统计 tabs + CSV download buttons. Returns (data_csv, cycles_csv)."""
+    t_prev, t_plot, t_cyc = st.tabs(["📋 数据预览", "📈 曲线", "🔁 循环统计"])
+
+    adjusted_df, adjusted_summ = df, summ
+    with t_cyc:
+        if len(adjusted_summ):
+            chart_col, controls_col = st.columns([4.8, 1.2], gap="large")
+            if allow_cycle_adjustments:
+                with controls_col:
+                    st.markdown("##### Capacity")
+                    cap_scale = st.number_input("百分比缩放 / %", value=100.0, step=1.0,
+                                                format="%.3f", key=f"cap-scale-{key}")
+                    cap_offset = st.number_input("固定 offset / mAh", value=0.0, step=0.001,
+                                                 format="%.6f", key=f"cap-offset-{key}")
+                    st.markdown("##### 库仑效率 CE")
+                    ce_scale = st.number_input("百分比缩放 / %", value=100.0, step=1.0,
+                                               format="%.3f", key=f"ce-scale-{key}")
+                    ce_offset = st.number_input("固定 offset / 百分点", value=0.0, step=0.1,
+                                                format="%.3f", key=f"ce-offset-{key}")
+                    st.caption("先调整每圈充、放电总容量，再调整 CE（放电容量 ÷ 充电容量）。"
+                               "容量 offset 为每圈增减量；CE offset 为百分点。电流与能量同步反算。")
+                try:
+                    adjusted_df = adjust_cycle_measurements(
+                        df,
+                        capacity_scale_pct=cap_scale,
+                        capacity_offset_mah=cap_offset,
+                        efficiency_scale_pct=ce_scale,
+                        efficiency_offset_pct=ce_offset,
+                    )
+                except ValueError as e:
+                    st.error(str(e))
+                    return b"", b""
+                adjusted_summ = cycle_summary(adjusted_df)
+            with chart_col:
+                st.plotly_chart(fig_cycles(adjusted_summ), use_container_width=True, key=f"cy-{key}")
+            st.dataframe(adjusted_summ, height=320, use_container_width=True, hide_index=True)
+        else:
+            st.info("没有可统计的循环。")
+
+    with t_prev:
+        st.dataframe(adjusted_df, height=420, use_container_width=True, hide_index=True)
+    with t_plot:
+        st.plotly_chart(fig_timeseries(adjusted_df), use_container_width=True, key=f"ts-{key}")
+        cyc_all = sorted(int(c) for c in adjusted_df.loc[adjusted_df["Mode"] != "Rest", "Cycle"].unique())
+        if cyc_all:
+            default = sorted({cyc_all[0], cyc_all[len(cyc_all) // 2], cyc_all[-1]})
+            chosen = st.multiselect("充放电曲线 – 选择循环", cyc_all, default=default, max_selections=8, key=f"cyc-{key}")
+            if chosen:
+                st.plotly_chart(fig_profiles(adjusted_df, chosen), use_container_width=True, key=f"pr-{key}")
+
+    b = st.columns([1, 1, 4])
+    data_csv = csv_bytes(adjusted_df)
+    summ_csv = csv_bytes(adjusted_summ) if len(adjusted_summ) else b""
+    b[0].download_button("⬇️ 下载数据 CSV", data_csv, file_name=f"{stem}.csv", mime="text/csv", key=f"d-{key}")
+    if summ_csv:
+        b[1].download_button("⬇️ 下载循环统计 CSV", summ_csv, file_name=f"{stem}_cycles.csv", mime="text/csv", key=f"s-{key}")
+    return data_csv, summ_csv
+
+
+def guess_start_datetime(raw: pd.DataFrame) -> dt.datetime | None:
+    """If the CSV carries an absolute date/time column, use its first value as the test start."""
+    for c in raw.columns:
+        n = str(c).lower()
+        if any(k in n for k in ("datetime", "date", "timestamp", "绝对时间", "日期")):
+            try:
+                v = pd.to_datetime(raw[c].dropna().iloc[0])
+                return v.to_pydatetime().replace(microsecond=0)
+            except (ValueError, TypeError, IndexError):
+                continue
+    return None
+
+
 # ----------------------------------------------------------------------------- sidebar
 with st.sidebar:
     st.title("🔋 LAND CEX 工具")
@@ -146,12 +220,6 @@ with tab_read:
     files = st.file_uploader("拖放 .cex 文件 / Drop .cex files", type=["cex"], accept_multiple_files=True,
                              label_visibility="collapsed")
     inputs: list[tuple[str, bytes]] = [(f.name, f.getvalue()) for f in files or []]
-    with st.expander("或从本地目录选择 / or pick from a local folder"):
-        folder = st.text_input("目录", value=str(Path(__file__).with_name("samples")))
-        local = sorted(p for p in Path(folder).glob("*.cex")) if Path(folder).is_dir() else []
-        picked = st.multiselect("文件", [p.name for p in local]) if local else []
-        inputs += [(p.name, p.read_bytes()) for p in local if p.name in picked]
-
     exports: list[tuple[str, bytes]] = []
     for name, data in inputs:
         stem = Path(name).stem
@@ -179,32 +247,10 @@ with tab_read:
             with st.expander("工步设置 Recipe"):
                 st.dataframe(pd.DataFrame(meta["recipe"]), hide_index=True, use_container_width=True)
 
-            t_prev, t_plot, t_cyc = st.tabs(["📋 数据预览", "📈 曲线", "🔁 循环统计"])
-            with t_prev:
-                st.dataframe(df, height=420, use_container_width=True, hide_index=True)
-            with t_plot:
-                st.plotly_chart(fig_timeseries(df), use_container_width=True, key=f"ts-{stem}")
-                cyc_all = sorted(int(c) for c in df.loc[df["Mode"] != "Rest", "Cycle"].unique())
-                if cyc_all:
-                    default = sorted({cyc_all[0], cyc_all[len(cyc_all) // 2], cyc_all[-1]})
-                    chosen = st.multiselect("充放电曲线 – 选择循环", cyc_all, default=default, max_selections=8,
-                                            key=f"cyc-{stem}")
-                    if chosen:
-                        st.plotly_chart(fig_profiles(df, chosen), use_container_width=True, key=f"pr-{stem}")
-            with t_cyc:
-                if len(summ):
-                    st.plotly_chart(fig_cycles(summ), use_container_width=True, key=f"cy-{stem}")
-                    st.dataframe(summ, height=320, use_container_width=True, hide_index=True)
-                else:
-                    st.info("没有可统计的循环。")
-
-            b = st.columns([1, 1, 4])
-            data_csv = csv_bytes(df)
-            summ_csv = csv_bytes(summ) if len(summ) else b""
-            b[0].download_button("⬇️ 下载数据 CSV", data_csv, file_name=f"{stem}.csv", mime="text/csv", key=f"d-{stem}")
-            if summ_csv:
-                b[1].download_button("⬇️ 下载循环统计 CSV", summ_csv, file_name=f"{stem}_cycles.csv", mime="text/csv", key=f"s-{stem}")
-            exports.append((f"{stem}.csv", data_csv))
+            data_csv, summ_csv = render_dataset(stem, df, summ, key=f"read-{stem}",
+                                                allow_cycle_adjustments=True)
+            if data_csv:
+                exports.append((f"{stem}.csv", data_csv))
             if summ_csv:
                 exports.append((f"{stem}_cycles.csv", summ_csv))
 
@@ -218,25 +264,19 @@ with tab_read:
 # ============================================================================= CSV -> CEX
 with tab_write:
     st.markdown(
-        "上传 CSV（本工具导出的 CSV 可直接转换；其它来源的表格至少需要 **累计时间** 与 **电压** 两列，"
-        "有 **电流** 列时会自动划分静置 / 充电 / 放电工步并积分容量、能量）。"
+        "上传只含 **测量量** 的 CSV 即可：**累计时间、电压、电流**（三列，列名与单位自动识别，可手动改）。"
+        "工具会自动划分静置 / 放电 / 充电工步，积分出 **容量、能量**，并计算 **循环号、工步时间、DateTime**，"
+        "生成与仪器 `.cex` 数据种类完全一致的文件；下方直接预览计算结果。"
+        "（本工具导出的 CSV 也可直接转回；可选提供容量 / 能量 / 工步号 / 工步类型列，有则优先采用。）"
     )
     c1, c2 = st.columns(2)
     csv_file = c1.file_uploader("拖放 CSV / Drop CSV", type=["csv", "txt"])
     tpl_file = c2.file_uploader("模板 .cex（可选，用其文件头 / 工步设置）", type=["cex"])
 
-    csv_name, csv_data = (csv_file.name, csv_file.getvalue()) if csv_file else (None, None)
-    with st.expander("或从本地目录选择 CSV / or pick a CSV from a local folder"):
-        folder2 = st.text_input("目录", value=str(Path(__file__).with_name("samples")), key="csv-folder")
-        local2 = sorted(p for p in Path(folder2).glob("*.csv")) if Path(folder2).is_dir() else []
-        pick2 = st.selectbox("文件", ["(无)"] + [p.name for p in local2], key="csv-pick") if local2 else "(无)"
-        if pick2 != "(无)" and csv_file is None:
-            p = next(p for p in local2 if p.name == pick2)
-            csv_name, csv_data = p.name, p.read_bytes()
-
-    if csv_data is not None:
+    if csv_file:
+        csv_name = csv_file.name
         try:
-            raw = read_table(csv_data)
+            raw = read_table(csv_file.getvalue())
         except Exception as e:  # noqa: BLE001
             st.error(f"读取 CSV 失败: {e}")
             st.stop()
@@ -265,9 +305,10 @@ with tab_write:
                                                key=f"unit-{role}", label_visibility="collapsed")
 
         st.markdown("**文件信息**")
+        guess = guess_start_datetime(raw)
         o = st.columns(4)
-        d0 = o[0].date_input("开始日期", value=dt.date.today())
-        t0 = o[1].time_input("开始时刻", value=dt.time(0, 0))
+        d0 = o[0].date_input("开始日期", value=guess.date() if guess else dt.date.today())
+        t0 = o[1].time_input("开始时刻", value=guess.time() if guess else dt.time(0, 0))
         ch = o[2].number_input("通道号 (1 起)", min_value=1, max_value=256, value=1)
         patch = o[3].checkbox("按数据更新工步设置(电流/截止电压)", value=True)
         start_ts = int(dt.datetime.combine(d0, t0).replace(tzinfo=dt.timezone.utc).timestamp())
@@ -303,13 +344,26 @@ with tab_write:
             st.error(f"生成失败: {e}")
             st.stop()
 
+        summ_back = cycle_summary(df_back)
+        stem = Path(csv_name).stem
         st.success(f"已生成 .cex：{len(out):,} 字节，{back.n_records:,} 条记录，{len(back.steps)} 个工步，"
                    f"{int(df_back['Cycle'].max()) if len(df_back) else 0} 个循环；校验和 {'✅' if all(back.checksums_ok().values()) else '❌'}")
-        st.download_button("⬇️ 下载 .cex", out, file_name=f"{Path(csv_name).stem}.cex",
-                           mime="application/octet-stream", type="primary")
-        with st.expander("回读校验（解析生成的文件）"):
-            st.plotly_chart(fig_timeseries(df_back), use_container_width=True, key="back-ts")
-            st.dataframe(df_back.head(200), use_container_width=True, hide_index=True)
+        st.download_button("⬇️ 下载 .cex", out, file_name=f"{stem}.cex", mime="application/octet-stream", type="primary")
+
+        # what came from the CSV vs. what was computed
+        role_cols = {"time": "TestTime_s", "voltage": "Voltage_V", "current": "Current_mA",
+                     "capacity": "Capacity_mAh", "energy": "Energy_mWh", "step": "Step / StepSeq", "mode": "Mode"}
+        how = {"capacity": "Capacity_mAh = ∫|I|dt/3600", "energy": "Energy_mWh = ∫V·|I|dt/3600",
+               "step": "Step / StepSeq（按电流符号分段）", "mode": "Mode（按电流符号）"}
+        provided = [role_cols[r] for r in ROLES if mapping.get(r)]
+        computed = [how[r] for r in ROLES if not mapping.get(r) and r in how]
+        computed += ["Cycle（工步号不再递增时 +1）", "StepTime_s = TestTime_s − 工步首条", "DateTime = 开始时间 + TestTime_s"]
+        st.markdown(f"**来自 CSV：** {'、'.join(provided)}  \n**计算得到：** {'、'.join(computed)}")
+        dv = float(np.abs(df_back["Voltage_V"].to_numpy() - table["voltage_v"].to_numpy()).max()) * 1e3
+        di = float(np.abs(df_back["Current_mA"].to_numpy() - table["current_ma"].to_numpy()).max()) * 1e3
+        st.caption(f"写入 .cex 的量化误差（受 LSB 分辨率限制）：电压 ≤ {dv:.3f} mV，电流 ≤ {di:.3f} µA。"
+                   "下方显示从生成的 .cex 回读的数据；循环统计按本工具的工步分组和放电/充电容量比计算。")
+        render_dataset(stem, df_back, summ_back, key="csv2cex")
 
 # ============================================================================= docs
 with tab_doc:

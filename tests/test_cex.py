@@ -1,3 +1,4 @@
+import io
 import struct
 from pathlib import Path
 
@@ -6,7 +7,8 @@ import pandas as pd
 import pytest
 
 from cex_tool import format as F
-from cex_tool.reader import _read_records, assign_cycles, cycle_summary, parse_cex, to_dataframe
+from cex_tool.reader import (_read_records, adjust_cycle_measurements, assign_cycles,
+                             cycle_summary, parse_cex, to_dataframe)
 from cex_tool.writer import (build_cex, detect_columns, load_template, normalize_table,
                              segment_table, template_from_cex)
 
@@ -57,6 +59,95 @@ def test_assign_cycles():
     assert assign_cycles([]) == []
 
 
+def test_adjust_cycle_measurements_updates_capacity_and_efficiency():
+    rows = []
+    for cyc, qd, qc in ((1, 8.0, 10.0), (2, 9.0, 10.0)):
+        for mode, q in (("CC_DChg", qd), ("CC_Chg", qc)):
+            for value in (0.0, q):
+                rows.append({"Cycle": cyc, "StepSeq": len(rows) // 2 + 1, "Mode": mode,
+                             "Capacity_mAh": value, "Energy_mWh": value,
+                             "Voltage_V": 1.0, "DateTime": pd.Timestamp("2026-01-01"),
+                             "TestTime_s": float(len(rows))})
+    df = pd.DataFrame(rows)
+
+    adjusted = adjust_cycle_measurements(
+        df, capacity_scale_pct=110, capacity_offset_mah=1,
+        efficiency_scale_pct=90, efficiency_offset_pct=2,
+    )
+    summary = cycle_summary(adjusted)
+
+    # Charge data receives the direct capacity transform.
+    assert adjusted.loc[adjusted["Mode"] == "CC_Chg", "Capacity_mAh"].max() == pytest.approx(12.0)
+    # Capacity transform gives 81.667 % / 90.833 %, then CE ×90 % +2 points.
+    np.testing.assert_allclose(summary["CoulombicEfficiency_pct"], [75.5, 83.75])
+    assert not adjusted["Capacity_mAh"].equals(df["Capacity_mAh"])
+    assert df["Capacity_mAh"].iloc[0] == 0.0  # input is not mutated
+
+    capacity_only = adjust_cycle_measurements(df, capacity_scale_pct=110, capacity_offset_mah=1)
+    expected = cycle_summary(df)
+    actual = cycle_summary(capacity_only)
+    for col in ("DischargeCapacity_mAh", "ChargeCapacity_mAh"):
+        np.testing.assert_allclose(actual[col], expected[col] * 1.1 + 1)
+    assert (capacity_only.groupby("StepSeq")["Capacity_mAh"].first() == 0).all()
+    pd.testing.assert_frame_equal(adjust_cycle_measurements(df), df)
+
+
+@pytest.mark.parametrize("offset", [0.01, -0.001])
+def test_adjusted_csv_cex_roundtrip_and_integrals(offset):
+    raw = _synthetic()
+    # Unequal charge/discharge capacity is essential to detect CE distortion.
+    raw.loc[raw["Current/mA"] < 0, "Current/mA"] *= 0.8
+    original = to_dataframe(parse_cex(build_cex(normalize_table(raw), start_ts=1_800_000_000)))
+    snapshot = original.copy(deep=True)
+    adjusted = adjust_cycle_measurements(original, capacity_scale_pct=130,
+                                         capacity_offset_mah=offset,
+                                         efficiency_scale_pct=97, efficiency_offset_pct=2)
+    before = cycle_summary(original).iloc[0]
+    after = cycle_summary(adjusted).iloc[0]
+    qc = before["ChargeCapacity_mAh"] * 1.3 + offset
+    qd = before["DischargeCapacity_mAh"] * 1.3 + offset
+    assert after["ChargeCapacity_mAh"] == pytest.approx(qc)
+    assert after["CoulombicEfficiency_pct"] == pytest.approx(qd / qc * 100 * .97 + 2)
+    pd.testing.assert_frame_equal(original, snapshot)
+    pd.testing.assert_frame_equal(adjusted[adjusted.Mode == "Rest"], original[original.Mode == "Rest"])
+
+    for _, step in adjusted[adjusted.Mode != "Rest"].groupby("StepSeq"):
+        q = step.Capacity_mAh.to_numpy()
+        v = step.Voltage_V.to_numpy()
+        t = step.TestTime_s.to_numpy()
+        i = abs(step.Current_mA.to_numpy())
+        assert q[0] == 0
+        assert q[-1] == pytest.approx(np.sum((i[1:] + i[:-1]) / 2 * np.diff(t)) / 3600)
+        np.testing.assert_allclose(step.Energy_mWh,
+                                   np.r_[0., np.cumsum((v[1:] + v[:-1]) / 2 * np.diff(q))])
+
+    csv = pd.read_csv(io.StringIO(adjusted.to_csv(index=False, float_format="%.12g")))
+    encoded = parse_cex(build_cex(normalize_table(csv), start_ts=1_800_000_000))
+    assert all(encoded.checksums_ok().values())
+    back = to_dataframe(encoded)
+    for col in ("Capacity_mAh", "Energy_mWh"):
+        np.testing.assert_allclose(back[col], adjusted[col], rtol=1e-6, atol=1e-10)
+    np.testing.assert_allclose(back.Current_mA, adjusted.Current_mA, atol=F.I_LSB * 1e3 / 2)
+    np.testing.assert_allclose(cycle_summary(back).CoulombicEfficiency_pct,
+                               cycle_summary(adjusted).CoulombicEfficiency_pct, rtol=1e-6)
+
+
+def test_capacity_offset_is_per_cycle_not_per_step():
+    df = to_dataframe(parse_cex(build_cex(normalize_table(_synthetic()), start_ts=1_800_000_000)))
+    # Two discharge steps in the same cycle must share one offset.
+    extra = df[df.Mode == "CC_DChg"].copy()
+    extra["StepSeq"] = 4
+    df = pd.concat([df, extra], ignore_index=True)
+    adjusted = adjust_cycle_measurements(df, capacity_offset_mah=.01)
+    before, after = cycle_summary(df).iloc[0], cycle_summary(adjusted).iloc[0]
+    assert after.DischargeCapacity_mAh == pytest.approx(before.DischargeCapacity_mAh + .01)
+    assert after.ChargeCapacity_mAh == pytest.approx(before.ChargeCapacity_mAh + .01)
+    with pytest.raises(ValueError, match="目标容量"):
+        adjust_cycle_measurements(df, capacity_offset_mah=-1)
+    with pytest.raises(ValueError, match="目标库仑效率"):
+        adjust_cycle_measurements(df, efficiency_offset_pct=-1000)
+
+
 # --------------------------------------------------------------------------- writer
 @needs_samples
 def test_roundtrip_sample():
@@ -102,6 +193,22 @@ def _step_header_offsets(data: bytes) -> list[int]:
         else:
             break
     return offs
+
+
+@needs_samples
+def test_measured_only_csv_reproduces_instrument_values():
+    """Only (time, V, I) in → same steps/cycles, capacity & energy within 0.2 % of the tester's own."""
+    ref = to_dataframe(parse_cex(SAMPLES[0].read_bytes()))
+    meas = pd.DataFrame({"Time(s)": ref["TestTime_s"], "Voltage(V)": ref["Voltage_V"], "Current(mA)": ref["Current_mA"]})
+    df = to_dataframe(parse_cex(build_cex(normalize_table(meas), start_ts=1_784_175_647)))
+    assert len(df) == len(ref)
+    assert (df["Step"].to_numpy() == ref["Step"].to_numpy()).all()
+    assert (df["Mode"].astype(str).to_numpy() == ref["Mode"].astype(str).to_numpy()).all()
+    assert df["Cycle"].max() == ref["Cycle"].max()
+    for col in ("Capacity_mAh", "Energy_mWh"):
+        assert (df[col] - ref[col]).abs().max() < 0.002 * ref[col].abs().max()
+    s1, s2 = cycle_summary(df), cycle_summary(ref)
+    assert (s1["CoulombicEfficiency_pct"] - s2["CoulombicEfficiency_pct"]).abs().max() < 0.3
 
 
 def _synthetic():
