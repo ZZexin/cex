@@ -8,35 +8,15 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
-from plotly.subplots import make_subplots
 
 from cex_tool import format as F
-from cex_tool.reader import adjust_cycle_measurements, cycle_summary, parse_cex, to_dataframe
+from cex_tool.reader import cycle_summary, parse_cex, to_dataframe
+from cex_tool.ui import MODE_ZH, csv_bytes, render_dataset
 from cex_tool.writer import (ROLES, UNIT_FACTORS, build_cex, detect_columns, load_template,
                              normalize_table, segment_table, template_from_cex)
 
 st.set_page_config(page_title="LAND CEX 工具", page_icon="🔋", layout="wide")
-
-# validated categorical palette (dataviz reference instance)
-C = {"blue": "#2a78d6", "orange": "#eb6834", "aqua": "#1baf7a", "yellow": "#eda100",
-     "magenta": "#e87ba4", "green": "#008300", "violet": "#4a3aa7", "red": "#e34948"}
-SERIES = list(C.values())
-GRID = "#e1e0d9"
-FONT = dict(family="system-ui, -apple-system, 'Segoe UI', sans-serif", size=13)
-MODE_ZH = {"Rest": "静置", "CC_DChg": "恒流放电", "CC_Chg": "恒流充电"}
-
-
-def _layout(fig: go.Figure, height: int) -> go.Figure:
-    fig.update_layout(height=height, template="plotly_white", font=FONT,
-                      margin=dict(l=56, r=20, t=40, b=90), hovermode="x unified",
-                      legend=dict(orientation="h", yanchor="top", y=-0.16, x=0),
-                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)")
-    fig.update_xaxes(gridcolor=GRID, zeroline=False, showline=True, linecolor="#c3c2b7")
-    fig.update_yaxes(gridcolor=GRID, zeroline=False)
-    return fig
-
 
 # ----------------------------------------------------------------------------- cached work
 @st.cache_data(show_spinner="解析 .cex …")
@@ -60,11 +40,6 @@ def parse_bytes(data: bytes, v_lsb: float, i_lsb: float):
 
 
 @st.cache_data(show_spinner=False)
-def csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False, float_format="%.12g").encode("utf-8-sig")
-
-
-@st.cache_data(show_spinner=False)
 def read_table(data: bytes) -> pd.DataFrame:
     last = None
     for enc in ("utf-8-sig", "gbk", "latin-1"):
@@ -73,119 +48,6 @@ def read_table(data: bytes) -> pd.DataFrame:
         except UnicodeDecodeError as e:  # try next encoding
             last = e
     raise last  # pragma: no cover
-
-
-# ----------------------------------------------------------------------------- charts
-def fig_timeseries(df: pd.DataFrame) -> go.Figure:
-    stride = max(1, len(df) // 200_000)
-    d = df.iloc[::stride]
-    x = d["TestTime_s"] / 3600
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-                        subplot_titles=("电压 Voltage / V", "电流 Current / mA"))
-    fig.add_trace(go.Scattergl(x=x, y=d["Voltage_V"], mode="lines", name="电压 Voltage",
-                               line=dict(width=1.5, color=C["blue"]),
-                               hovertemplate="%{y:.4f} V<extra></extra>"), row=1, col=1)
-    fig.add_trace(go.Scattergl(x=x, y=d["Current_mA"], mode="lines", name="电流 Current",
-                               line=dict(width=1.5, color=C["orange"]),
-                               hovertemplate="%{y:.4f} mA<extra></extra>"), row=2, col=1)
-    fig.update_xaxes(title_text="测试时间 Test time / h", row=2, col=1)
-    return _layout(fig, 540)
-
-
-def fig_cycles(summ: pd.DataFrame) -> go.Figure:
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, row_heights=[0.62, 0.38],
-                        subplot_titles=("容量 Capacity / mAh", "库伦效率 Coulombic efficiency / %"))
-    common = dict(mode="lines+markers", marker=dict(size=5), line=dict(width=1.5))
-    fig.add_trace(go.Scatter(x=summ["Cycle"], y=summ["DischargeCapacity_mAh"], name="放电容量 Discharge",
-                             marker_color=C["blue"], line_color=C["blue"], **common,
-                             hovertemplate="%{y:.5f} mAh<extra>放电</extra>"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=summ["Cycle"], y=summ["ChargeCapacity_mAh"], name="充电容量 Charge",
-                             marker_color=C["orange"], line_color=C["orange"], **common,
-                             hovertemplate="%{y:.5f} mAh<extra>充电</extra>"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=summ["Cycle"], y=summ["CoulombicEfficiency_pct"], name="库伦效率 CE",
-                             marker_color=C["aqua"], line_color=C["aqua"], **common,
-                             hovertemplate="%{y:.2f} %<extra>CE</extra>"), row=2, col=1)
-    fig.update_xaxes(title_text="循环 Cycle", row=2, col=1)
-    return _layout(fig, 520)
-
-
-def fig_profiles(df: pd.DataFrame, cycles: list[int]) -> go.Figure:
-    fig = go.Figure()
-    for k, cyc in enumerate(cycles):
-        color = SERIES[k % len(SERIES)]
-        d = df[df["Cycle"] == cyc]
-        for mode, dash, zh in (("CC_DChg", "solid", "放电"), ("CC_Chg", "dot", "充电")):
-            dd = d[d["Mode"] == mode]
-            if len(dd):
-                fig.add_trace(go.Scattergl(x=dd["Capacity_mAh"], y=dd["Voltage_V"], mode="lines",
-                                           name=f"第 {cyc} 圈 {zh}", legendgroup=str(cyc),
-                                           line=dict(color=color, width=1.5, dash=dash),
-                                           hovertemplate="%{x:.5f} mAh · %{y:.4f} V<extra>" + f"C{cyc} {zh}</extra>"))
-    fig.update_layout(xaxis_title="容量 Capacity / mAh", yaxis_title="电压 Voltage / V")
-    fig = _layout(fig, 480)
-    fig.update_layout(hovermode="closest")
-    return fig
-
-
-def render_dataset(stem: str, df: pd.DataFrame, summ: pd.DataFrame, key: str,
-                   allow_cycle_adjustments: bool = False) -> tuple[bytes, bytes]:
-    """预览 / 曲线 / 循环统计 tabs + CSV download buttons. Returns (data_csv, cycles_csv)."""
-    t_prev, t_plot, t_cyc = st.tabs(["📋 数据预览", "📈 曲线", "🔁 循环统计"])
-
-    adjusted_df, adjusted_summ = df, summ
-    with t_cyc:
-        if len(adjusted_summ):
-            chart_col, controls_col = st.columns([4.8, 1.2], gap="large")
-            if allow_cycle_adjustments:
-                with controls_col:
-                    st.markdown("##### Capacity")
-                    cap_scale = st.number_input("百分比缩放 / %", value=100.0, step=1.0,
-                                                format="%.3f", key=f"cap-scale-{key}")
-                    cap_offset = st.number_input("固定 offset / mAh", value=0.0, step=0.001,
-                                                 format="%.6f", key=f"cap-offset-{key}")
-                    st.markdown("##### 库仑效率 CE")
-                    ce_scale = st.number_input("百分比缩放 / %", value=100.0, step=1.0,
-                                               format="%.3f", key=f"ce-scale-{key}")
-                    ce_offset = st.number_input("固定 offset / 百分点", value=0.0, step=0.1,
-                                                format="%.3f", key=f"ce-offset-{key}")
-                    st.caption("先调整每圈充、放电总容量，再调整 CE（放电容量 ÷ 充电容量）。"
-                               "容量 offset 为每圈增减量；CE offset 为百分点。电流与能量同步反算。")
-                try:
-                    adjusted_df = adjust_cycle_measurements(
-                        df,
-                        capacity_scale_pct=cap_scale,
-                        capacity_offset_mah=cap_offset,
-                        efficiency_scale_pct=ce_scale,
-                        efficiency_offset_pct=ce_offset,
-                    )
-                except ValueError as e:
-                    st.error(str(e))
-                    return b"", b""
-                adjusted_summ = cycle_summary(adjusted_df)
-            with chart_col:
-                st.plotly_chart(fig_cycles(adjusted_summ), use_container_width=True, key=f"cy-{key}")
-            st.dataframe(adjusted_summ, height=320, use_container_width=True, hide_index=True)
-        else:
-            st.info("没有可统计的循环。")
-
-    with t_prev:
-        st.dataframe(adjusted_df, height=420, use_container_width=True, hide_index=True)
-    with t_plot:
-        st.plotly_chart(fig_timeseries(adjusted_df), use_container_width=True, key=f"ts-{key}")
-        cyc_all = sorted(int(c) for c in adjusted_df.loc[adjusted_df["Mode"] != "Rest", "Cycle"].unique())
-        if cyc_all:
-            default = sorted({cyc_all[0], cyc_all[len(cyc_all) // 2], cyc_all[-1]})
-            chosen = st.multiselect("充放电曲线 – 选择循环", cyc_all, default=default, max_selections=8, key=f"cyc-{key}")
-            if chosen:
-                st.plotly_chart(fig_profiles(adjusted_df, chosen), use_container_width=True, key=f"pr-{key}")
-
-    b = st.columns([1, 1, 4])
-    data_csv = csv_bytes(adjusted_df)
-    summ_csv = csv_bytes(adjusted_summ) if len(adjusted_summ) else b""
-    b[0].download_button("⬇️ 下载数据 CSV", data_csv, file_name=f"{stem}.csv", mime="text/csv", key=f"d-{key}")
-    if summ_csv:
-        b[1].download_button("⬇️ 下载循环统计 CSV", summ_csv, file_name=f"{stem}_cycles.csv", mime="text/csv", key=f"s-{key}")
-    return data_csv, summ_csv
 
 
 def guess_start_datetime(raw: pd.DataFrame) -> dt.datetime | None:
@@ -205,6 +67,7 @@ def guess_start_datetime(raw: pd.DataFrame) -> dt.datetime | None:
 with st.sidebar:
     st.title("🔋 LAND CEX 工具")
     st.caption("蓝电 (LAND) 电池测试 `.cex` 数据解码 / 转换")
+    st.page_link("pages/1_NDAX.py", label="打开新威 NDAX 页面", icon="🔬")
     st.subheader("⚙️ 原始值换算")
     v_lsb = st.number_input("电压分辨率 mV / LSB", value=F.V_LSB * 1e3, format="%.5f", step=0.001, min_value=1e-6) * 1e-3
     i_lsb = st.number_input("电流分辨率 µA / LSB", value=F.I_LSB * 1e6, format="%.4f", step=0.01, min_value=1e-6) * 1e-6

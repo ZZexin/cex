@@ -48,6 +48,16 @@ open("out.cex", "wb").write(build_cex(table, start_ts=1_784_176_364, channel=11)
 数据预览、曲线、CSV 和 ZIP 使用相同的调整结果，CSV 转回 CEX 时 offset 不会被工步归零抵消。
 转换后的容量、能量受 float32 精度限制，电流受通道分辨率限制。末圈未完成测试时仍按实际记录统计。
 
+## 新威 NDAX 独立页面
+
+启动方式仍为 `streamlit run app.py`。从侧栏的「打开新威 NDAX 页面」进入，支持 NDAX 多文件上传、
+工步与修改历史、测量预览、曲线、循环统计、容量/效率调整以及 CSV/ZIP 下载。
+它使用 NDAX 每条记录的电流量程，不受 LAND 页面 LSB 设置影响。
+当前验证了 NDC v5 / type 1 的单 data.ndc 格式，未知版本和量程明确报错；暂不提供 NDAX 写回。
+
+文件结构和公式见 [NDAX_FORMAT.md](docs/NDAX_FORMAT.md)，
+本次两份文件的分析见 [NDAX_SAMPLES.md](docs/NDAX_SAMPLES.md)。
+
 ## CSV → CEX
 
 - 只需上传 **测量量**：累计时间、电压、电流三列（列名与单位自动识别：`Time`, `TestTime(s)`, `电压/V`,

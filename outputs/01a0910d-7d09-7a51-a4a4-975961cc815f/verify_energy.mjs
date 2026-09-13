@@ -1,0 +1,17 @@
+import fs from 'node:fs/promises';
+import {FileBlob,SpreadsheetFile} from '@oai/artifact-tool';
+const dir='C:/Users/Zexin/Documents/cex/outputs/01a0910d-7d09-7a51-a4a4-975961cc815f';
+const wb=await SpreadsheetFile.importXlsx(await FileBlob.load(`${dir}/SNO2ZMO_10_G2_Energy修正版.xlsx`));
+const s=wb.worksheets.getItem('SNO2ZMO_10_G2');
+const value=a=>s.getRange(a).values[0][0];
+const before=value('N749'),v=value('H749'),q=value('M749');
+s.getRange('H749').values=[[v+0.1]];
+wb.recalculate();
+if(Math.abs(value('N749')-before-0.1*q/2)>1e-12)throw Error('Voltage recalculation failed');
+if(value('N748')!==0)throw Error('Step reset failed');
+s.getRange('H749').values=[[v]];
+wb.recalculate();
+if(Math.abs(value('N749')-before)>1e-12)throw Error('Restore failed');
+const image=await wb.render({sheetName:s.name,range:'L747:N752',scale:1.5,format:'png'});
+await fs.writeFile(`${dir}/energy_final_boundary.png`,new Uint8Array(await image.arrayBuffer()));
+console.log('Final workbook reopened; live voltage dependency and step-reset checks passed. No test edits saved.');

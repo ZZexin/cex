@@ -274,8 +274,8 @@ def cycle_summary(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     rows = []
     for cyc, d in df.groupby("Cycle", sort=True):
-        dch = d[d["Mode"] == "CC_DChg"]
-        chg = d[d["Mode"] == "CC_Chg"]
+        dch = d[d["Mode"].astype(str).str.endswith("_DChg")]
+        chg = d[d["Mode"].astype(str).str.endswith("_Chg")]
 
         def _step_max(x: pd.DataFrame, col: str) -> float:
             return float(x.groupby("StepSeq")[col].max().sum()) if len(x) else np.nan
@@ -324,15 +324,17 @@ def adjust_cycle_measurements(
     if capacity_scale_pct < 0 or efficiency_scale_pct < 0:
         raise ValueError("百分比缩放不能为负数。")
 
-    active = out["Mode"].isin(["CC_Chg", "CC_DChg"])
     # Use positional indices so callers may supply a non-unique DataFrame index.
     source_index = out.index
     out = out.reset_index(drop=True)
-    groups = out.loc[active.to_numpy()].groupby(["Cycle", "Mode"], observed=True, sort=False)
+    directions = out["Mode"].astype(str).str.extract(r"_(DChg|Chg)$", expand=False).map(
+        {"Chg": "CC_Chg", "DChg": "CC_DChg"})
+    active = directions.notna()
+    groups = out.loc[active].groupby(["Cycle", directions], observed=True, sort=False)
     for cyc, cycle in out.loc[active.to_numpy()].groupby("Cycle", sort=False):
         targets = {}
         totals = {}
-        for mode, records in cycle.groupby("Mode", observed=True, sort=False):
+        for mode, records in cycle.groupby(directions.loc[cycle.index], observed=True, sort=False):
             total = float(records.groupby("StepSeq")["Capacity_mAh"].max().sum())
             target = total * capacity_scale_pct / 100.0 + capacity_offset_mah
             if not np.isfinite(total) or total <= 0 or not np.isfinite(target) or target <= 0:
